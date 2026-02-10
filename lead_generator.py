@@ -17,14 +17,12 @@ Requires:
 """
 
 import csv
-import json
 import logging
 import os
 import re
 import sys
 import time
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from dataclasses import dataclass
 
 import requests
 from dotenv import load_dotenv
@@ -84,6 +82,7 @@ log = logging.getLogger(__name__)
 class Lead:
     business_name: str = ""
     email: str = ""
+    email_source: str = ""  # "Google Places" or "Website Scraped"
     phone: str = ""
     address: str = ""
     business_type: str = ""
@@ -166,63 +165,261 @@ def get_place_details(place_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Email extraction
+# Email extraction — multi-strategy approach
 # ---------------------------------------------------------------------------
 
-
+# Matches standard email addresses in free text
 EMAIL_RE = re.compile(
     r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", re.IGNORECASE
 )
 
+# Matches mailto: links in HTML (more reliable than free-text regex)
+MAILTO_RE = re.compile(r'mailto:([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})', re.IGNORECASE)
 
-def extract_email_from_website(website_url: str) -> str:
-    """Try to scrape an email address from the business website."""
+# Common hospitality email prefixes to try when constructing guesses
+COMMON_PREFIXES = [
+    "info",
+    "contact",
+    "reservations",
+    "frontdesk",
+    "front.desk",
+    "stay",
+    "hello",
+    "gm",
+    "manager",
+    "sales",
+    "events",
+    "booking",
+    "inquiries",
+    "mail",
+    "admin",
+]
+
+# Domains / patterns that are false-positive noise, not real business emails
+_JUNK_DOMAINS = {
+    "example.com",
+    "sentry.io",
+    "wixpress.com",
+    "schema.org",
+    "w3.org",
+    "googleapis.com",
+    "gstatic.com",
+    "facebook.com",
+    "twitter.com",
+    "instagram.com",
+    "youtube.com",
+    "google.com",
+    "cloudflare.com",
+    "gravatar.com",
+}
+
+_JUNK_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".css", ".js", ".webp")
+
+HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+}
+
+# Pages to crawl on a business website, in priority order
+_CONTACT_PATHS = [
+    "",                # homepage
+    "/contact",
+    "/contact-us",
+    "/contactus",
+    "/about",
+    "/about-us",
+    "/aboutus",
+    "/info",
+    "/reservations",
+    "/book",
+    "/location",
+    "/locations",
+    "/our-story",
+    "/connect",
+    "/feedback",
+    "/reach-us",
+]
+
+
+def _is_junk_email(email: str) -> bool:
+    """Return True if the email looks like a false positive."""
+    email_lower = email.lower()
+    if email_lower.endswith(_JUNK_EXTENSIONS):
+        return True
+    domain = email_lower.split("@", 1)[-1]
+    if domain in _JUNK_DOMAINS:
+        return True
+    if "wordpress" in email_lower or "noreply" in email_lower or "no-reply" in email_lower:
+        return True
+    return False
+
+
+def _domain_from_url(url: str) -> str:
+    """Extract the root domain from a URL (e.g. 'example.com')."""
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname or ""
+        # Strip www.
+        if host.startswith("www."):
+            host = host[4:]
+        return host.lower()
+    except Exception:
+        return ""
+
+
+def _rank_emails(emails: list[str], site_domain: str) -> list[str]:
+    """
+    Sort candidate emails so the best ones come first:
+      1. Emails whose domain matches the website domain
+      2. Emails with preferred prefixes (info@, contact@, reservations@, …)
+      3. Everything else
+    """
+    preferred_prefix_set = set(COMMON_PREFIXES)
+
+    def _sort_key(email: str) -> tuple[int, int, str]:
+        local, _, domain = email.lower().partition("@")
+        # Priority 1: domain matches the business website
+        domain_match = 0 if (site_domain and domain == site_domain) else 1
+        # Priority 2: common business prefix
+        prefix_match = 0 if local in preferred_prefix_set else 1
+        return (domain_match, prefix_match, email)
+
+    return sorted(emails, key=_sort_key)
+
+
+def _fetch_page(url: str) -> str:
+    """Fetch a single page and return its text, or '' on any error."""
+    try:
+        resp = requests.get(
+            url, timeout=10, headers=HTTP_HEADERS, allow_redirects=True,
+        )
+        if resp.status_code == 200:
+            return resp.text
+    except requests.ConnectionError:
+        log.debug("  Connection failed: %s", url)
+    except requests.Timeout:
+        log.debug("  Timeout: %s", url)
+    except requests.TooManyRedirects:
+        log.debug("  Too many redirects: %s", url)
+    except Exception as exc:
+        log.debug("  Fetch error for %s: %s", url, exc)
+    return ""
+
+
+def _extract_emails_from_html(html: str) -> list[str]:
+    """Pull all candidate emails from a page using both mailto: and free-text regex."""
+    found: list[str] = []
+    # mailto: links are the highest signal
+    found.extend(MAILTO_RE.findall(html))
+    # Free-text regex
+    found.extend(EMAIL_RE.findall(html))
+    # Deduplicate preserving order, filter junk
+    seen: set[str] = set()
+    clean: list[str] = []
+    for e in found:
+        e_lower = e.lower()
+        if e_lower not in seen and not _is_junk_email(e_lower):
+            seen.add(e_lower)
+            clean.append(e_lower)
+    return clean
+
+
+def scrape_website_for_email(website_url: str) -> str:
+    """
+    Crawl a business website to find an email address.
+
+    Tries the homepage first, then common contact/about pages.
+    Extracts emails from mailto: links and free-text patterns,
+    then ranks them so domain-matching & business-prefix emails
+    sort to the top.
+
+    Returns the best email found, or ''.
+    """
     if not website_url:
         return ""
 
-    # Normalize URL
+    # Normalize
     if not website_url.startswith(("http://", "https://")):
         website_url = "https://" + website_url
 
-    pages_to_try = [website_url]
-    # Common contact page paths
-    for suffix in ["/contact", "/contact-us", "/about", "/about-us"]:
-        base = website_url.rstrip("/")
-        pages_to_try.append(base + suffix)
+    base = website_url.rstrip("/")
+    site_domain = _domain_from_url(base)
+    all_candidates: list[str] = []
 
-    for page_url in pages_to_try:
-        try:
-            resp = requests.get(
-                page_url,
-                timeout=10,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/120.0.0.0 Safari/537.36"
-                    )
-                },
-                allow_redirects=True,
-            )
-            if resp.status_code != 200:
-                continue
-            emails = EMAIL_RE.findall(resp.text)
-            # Filter out common false positives
-            filtered = [
-                e
-                for e in emails
-                if not e.endswith((".png", ".jpg", ".gif", ".svg", ".css", ".js"))
-                and "example.com" not in e
-                and "sentry.io" not in e
-                and "wixpress.com" not in e
-                and "wordpress" not in e.lower()
-                and "schema.org" not in e
-            ]
-            if filtered:
-                return filtered[0].lower()
-        except Exception:
+    for path in _CONTACT_PATHS:
+        page_url = base + path
+        html = _fetch_page(page_url)
+        if not html:
             continue
-    return ""
+        emails = _extract_emails_from_html(html)
+        all_candidates.extend(emails)
+
+        # Also look for links to other contact-like pages embedded in the HTML
+        # (e.g. <a href="/contact-us">) — we already cover common paths above,
+        # but some sites use non-standard paths like /get-in-touch
+        for match in re.finditer(r'href=["\']/?([^"\']*(?:contact|email|reach|connect)[^"\']*)["\']', html, re.IGNORECASE):
+            discovered = match.group(1)
+            if not discovered.startswith(("http://", "https://")):
+                discovered = base + "/" + discovered.lstrip("/")
+            # Avoid re-fetching pages we already tried
+            if discovered not in (base + p for p in _CONTACT_PATHS):
+                extra_html = _fetch_page(discovered)
+                if extra_html:
+                    all_candidates.extend(_extract_emails_from_html(extra_html))
+
+    # Deduplicate
+    seen: set[str] = set()
+    unique: list[str] = []
+    for e in all_candidates:
+        if e not in seen:
+            seen.add(e)
+            unique.append(e)
+
+    if not unique:
+        return ""
+
+    ranked = _rank_emails(unique, site_domain)
+    return ranked[0]
+
+
+def find_email(details: dict) -> tuple[str, str]:
+    """
+    Multi-strategy email finder.  Returns (email, source) where source is
+    one of 'Google Places' or 'Website Scraped'.
+
+    Strategy order:
+      1. Check if Google Places details already contain an email (rare but possible
+         in the formatted fields or website URL itself being a mailto:).
+      2. Scrape the business website for email addresses.
+    """
+    # --- Strategy 1: Google Places data ---
+    # Google sometimes embeds an email in the website field or additional fields
+    website = details.get("website", "")
+    if website.startswith("mailto:"):
+        email = website.replace("mailto:", "").strip()
+        if email and not _is_junk_email(email):
+            return email.lower(), "Google Places"
+
+    # The formatted_phone_number / formatted_address won't have email,
+    # but some custom fields might — check the raw detail blob
+    for field_name in ("email", "email_address"):
+        val = details.get(field_name, "")
+        if val and "@" in val and not _is_junk_email(val):
+            return val.lower(), "Google Places"
+
+    # --- Strategy 2: Scrape the website ---
+    if website:
+        log.debug("  Scraping website for email: %s", website)
+        email = scrape_website_for_email(website)
+        if email:
+            return email, "Website Scraped"
+
+    return "", ""
 
 
 # ---------------------------------------------------------------------------
@@ -422,9 +619,9 @@ def collect_leads() -> list[Lead]:
                 if not details:
                     continue
 
-                # Extract website and try to find email
+                # Find email via multi-strategy approach
+                email, email_source = find_email(details)
                 website = details.get("website", "")
-                email = extract_email_from_website(website)
 
                 # REQUIRED: skip leads without email
                 if not email:
@@ -444,6 +641,7 @@ def collect_leads() -> list[Lead]:
                 lead = Lead(
                     business_name=details.get("name", name),
                     email=email,
+                    email_source=email_source,
                     phone=details.get("formatted_phone_number", ""),
                     address=details.get("formatted_address", ""),
                     business_type=classify_business_type(types, query_type),
@@ -460,11 +658,12 @@ def collect_leads() -> list[Lead]:
 
                 qualified_leads.append(lead)
                 log.info(
-                    "  + Lead #%d: %s (score: %d, email: %s)",
+                    "  + Lead #%d: %s (score: %d, email: %s [%s])",
                     len(qualified_leads),
                     lead.business_name,
                     lead.lead_score,
                     lead.email,
+                    lead.email_source,
                 )
 
             # Check for next page
@@ -488,6 +687,7 @@ def collect_leads() -> list[Lead]:
 CSV_COLUMNS = [
     "Business Name",
     "Email",
+    "Email Source",
     "Phone",
     "Address",
     "Business Type",
@@ -512,6 +712,7 @@ def export_to_csv(leads: list[Lead], filepath: str) -> None:
                 [
                     lead.business_name,
                     lead.email,
+                    lead.email_source,
                     lead.phone,
                     lead.address,
                     lead.business_type,
@@ -565,6 +766,14 @@ def main() -> None:
         restaurants = sum(1 for l in leads if "Restaurant" in l.business_type)
         print(f"  Hotels      : {hotels}")
         print(f"  Restaurants : {restaurants}")
+
+        # Email source breakdown
+        from_google = sum(1 for l in leads if l.email_source == "Google Places")
+        from_website = sum(1 for l in leads if l.email_source == "Website Scraped")
+        print()
+        print("  Email sources:")
+        print(f"    Google Places  : {from_google}")
+        print(f"    Website Scraped: {from_website}")
     print("=" * 60)
 
 

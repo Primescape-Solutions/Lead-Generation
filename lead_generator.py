@@ -309,18 +309,19 @@ def _fetch_page(url: str) -> str:
     """Fetch a single page and return its text, or '' on any error."""
     try:
         resp = requests.get(
-            url, timeout=10, headers=HTTP_HEADERS, allow_redirects=True,
+            url, timeout=5, headers=HTTP_HEADERS, allow_redirects=True,
         )
         if resp.status_code == 200:
             return resp.text
+        log.info("      HTTP %d: %s", resp.status_code, url)
     except requests.ConnectionError:
-        log.debug("  Connection failed: %s", url)
+        log.info("      Connection refused: %s", url)
     except requests.Timeout:
-        log.debug("  Timeout: %s", url)
+        log.info("      Timeout (5s): %s", url)
     except requests.TooManyRedirects:
-        log.debug("  Too many redirects: %s", url)
+        log.info("      Too many redirects: %s", url)
     except Exception as exc:
-        log.debug("  Fetch error for %s: %s", url, exc)
+        log.info("      Fetch error for %s: %s", url, exc)
     return ""
 
 
@@ -351,6 +352,11 @@ def scrape_website_for_email(website_url: str) -> str:
     then ranks them so domain-matching & business-prefix emails
     sort to the top.
 
+    Performance optimizations:
+    - Stops crawling as soon as ANY email is found on a page
+    - 20-second total time budget per website (across all pages)
+    - 5-second timeout per individual page fetch
+
     Returns the best email found, or ''.
     """
     if not website_url:
@@ -363,27 +369,55 @@ def scrape_website_for_email(website_url: str) -> str:
     base = website_url.rstrip("/")
     site_domain = _domain_from_url(base)
     all_candidates: list[str] = []
+    pages_tried = 0
+    site_start = time.time()
+    SITE_TIME_BUDGET = 20  # seconds max per website
 
     for path in _CONTACT_PATHS:
+        # Time budget check
+        elapsed = time.time() - site_start
+        if elapsed > SITE_TIME_BUDGET:
+            log.info("      Time budget exhausted (%.1fs) after %d pages", elapsed, pages_tried)
+            break
+
         page_url = base + path
         html = _fetch_page(page_url)
+        pages_tried += 1
         if not html:
             continue
         emails = _extract_emails_from_html(html)
-        all_candidates.extend(emails)
+        if emails:
+            all_candidates.extend(emails)
+            log.info("      Found %d email(s) on %s — stopping crawl", len(emails), path or "/")
+            break  # EARLY EXIT: found email, stop crawling more pages
 
-        # Also look for links to other contact-like pages embedded in the HTML
-        # (e.g. <a href="/contact-us">) — we already cover common paths above,
-        # but some sites use non-standard paths like /get-in-touch
+        # Only look for discovered contact links if we haven't found anything yet
+        # and still have time budget
+        if time.time() - site_start > SITE_TIME_BUDGET:
+            break
+
         for match in re.finditer(r'href=["\']/?([^"\']*(?:contact|email|reach|connect)[^"\']*)["\']', html, re.IGNORECASE):
+            if time.time() - site_start > SITE_TIME_BUDGET:
+                break
             discovered = match.group(1)
             if not discovered.startswith(("http://", "https://")):
                 discovered = base + "/" + discovered.lstrip("/")
-            # Avoid re-fetching pages we already tried
             if discovered not in (base + p for p in _CONTACT_PATHS):
                 extra_html = _fetch_page(discovered)
+                pages_tried += 1
                 if extra_html:
-                    all_candidates.extend(_extract_emails_from_html(extra_html))
+                    extra_emails = _extract_emails_from_html(extra_html)
+                    if extra_emails:
+                        all_candidates.extend(extra_emails)
+                        log.info("      Found %d email(s) on discovered page — stopping", len(extra_emails))
+                        break
+            if all_candidates:
+                break
+        if all_candidates:
+            break
+
+    elapsed = time.time() - site_start
+    log.info("      Scrape done: %d pages in %.1fs, %d candidate(s)", pages_tried, elapsed, len(all_candidates))
 
     # Deduplicate
     seen: set[str] = set()
@@ -400,7 +434,7 @@ def scrape_website_for_email(website_url: str) -> str:
     return ranked[0]
 
 
-def find_email(details: dict) -> tuple[str, str]:
+def find_email(details: dict, business_name: str = "") -> tuple[str, str]:
     """
     Multi-strategy email finder.  Returns (email, source) where source is
     one of 'Google Places' or 'Website Scraped'.
@@ -410,27 +444,34 @@ def find_email(details: dict) -> tuple[str, str]:
          in the formatted fields or website URL itself being a mailto:).
       2. Scrape the business website for email addresses.
     """
+    prefix = f"    [{business_name}]" if business_name else "    "
+
     # --- Strategy 1: Google Places data ---
-    # Google sometimes embeds an email in the website field or additional fields
     website = details.get("website", "")
     if website.startswith("mailto:"):
         email = website.replace("mailto:", "").strip()
         if email and not _is_junk_email(email):
+            log.info("%s Email from Google Places mailto: %s", prefix, email)
             return email.lower(), "Google Places"
 
-    # The formatted_phone_number / formatted_address won't have email,
-    # but some custom fields might — check the raw detail blob
     for field_name in ("email", "email_address"):
         val = details.get(field_name, "")
         if val and "@" in val and not _is_junk_email(val):
+            log.info("%s Email from Google Places field '%s': %s", prefix, field_name, val)
             return val.lower(), "Google Places"
 
     # --- Strategy 2: Scrape the website ---
     if website:
-        log.debug("  Scraping website for email: %s", website)
+        log.info("%s No Google email. Scraping website: %s", prefix, website)
+        t0 = time.time()
         email = scrape_website_for_email(website)
+        elapsed = time.time() - t0
         if email:
+            log.info("%s Email found via scraping in %.1fs: %s", prefix, elapsed, email)
             return email, "Website Scraped"
+        log.info("%s No email found on website (%.1fs spent scraping)", prefix, elapsed)
+    else:
+        log.info("%s No website listed — cannot scrape for email", prefix)
 
     return "", ""
 
@@ -822,6 +863,50 @@ def build_notes(lead: Lead) -> str:
     return "; ".join(parts)
 
 
+def _print_stats_line(
+    total_scanned: int,
+    with_email: int,
+    qualified: int,
+    no_email: int,
+    dupes: int,
+    elapsed: float,
+) -> None:
+    """Print a compact running-stats line."""
+    log.info(
+        "  >>> STATS: %d scanned | %d have email | %d qualified | "
+        "%d no-email | %d dupes | %.0fs elapsed",
+        total_scanned, with_email, qualified, no_email, dupes, elapsed,
+    )
+
+
+def _incremental_save(leads: list[Lead], filepath: str) -> None:
+    """Save current leads to CSV (overwrites). Called periodically to avoid data loss."""
+    leads_sorted = sorted(leads, key=lambda x: x.lead_score, reverse=True)
+    with open(filepath, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(CSV_COLUMNS)
+        for lead in leads_sorted:
+            writer.writerow(
+                [
+                    lead.business_name,
+                    lead.email,
+                    lead.email_source,
+                    lead.phone,
+                    lead.address,
+                    lead.county,
+                    lead.business_type,
+                    lead.website,
+                    lead.google_rating,
+                    lead.num_reviews,
+                    lead.lead_score,
+                    lead.search_area,
+                    lead.tax_assessor_link,
+                    lead.notes,
+                ]
+            )
+    log.info("  >>> Incremental save: %d leads written to %s", len(leads), filepath)
+
+
 def collect_leads() -> list[Lead]:
     """
     Run the full lead collection pipeline.
@@ -830,18 +915,27 @@ def collect_leads() -> list[Lead]:
     de-duplicates by place_id across areas, enriches with county and
     tax-assessor data, and stops once TARGET_LEAD_COUNT qualified leads
     are collected.
+
+    Logs every business (kept or skipped) with the reason, prints running
+    stats after each business, and saves to CSV every 10 qualified leads.
     """
     seen_place_ids: set[str] = set()
     qualified_leads: list[Lead] = []
     duplicates_skipped = 0
     total_scanned = 0
+    total_with_email = 0
     skipped_no_email = 0
+    skipped_no_website = 0
+    skipped_closed = 0
+    last_save_count = 0
+    run_start = time.time()
 
     area_names = [a["name"] for a in SEARCH_AREAS]
     log.info("Starting lead collection for hospitality businesses")
     log.info("Search areas: %s", " | ".join(area_names))
     log.info("Target: %d qualified leads (must have email)", TARGET_LEAD_COUNT)
     log.info("Search radius: 25 miles per area")
+    log.info("Incremental saves every 10 qualified leads to %s", OUTPUT_FILE)
     log.info("-" * 60)
 
     for area in SEARCH_AREAS:
@@ -851,16 +945,19 @@ def collect_leads() -> list[Lead]:
         area_name = area["name"]
         area_lat = area["lat"]
         area_lng = area["lng"]
-        # Short city name for building the search query
-        area_city = area_name.split(",")[0]  # e.g. "Elkin"
+        area_city = area_name.split(",")[0]
 
-        log.info("=== Searching area: %s ===", area_name)
+        log.info("")
+        log.info("=" * 60)
+        log.info("=== SEARCH AREA: %s ===", area_name)
+        log.info("=" * 60)
 
         for query_text, query_type in SEARCH_QUERIES:
             if len(qualified_leads) >= TARGET_LEAD_COUNT:
                 break
 
             full_query = f"{query_text} near {area_city} NC"
+            log.info("")
             log.info("  Query: '%s'", full_query)
 
             page_token = None
@@ -870,18 +967,28 @@ def collect_leads() -> list[Lead]:
                 if len(qualified_leads) >= TARGET_LEAD_COUNT:
                     break
 
+                api_start = time.time()
                 result = search_nearby(full_query, area_lat, area_lng, page_token)
+                api_time = time.time() - api_start
                 places = result.get("results", [])
 
+                # Log API status
+                api_status = result.get("status", "unknown")
+                if api_status != "OK" and api_status != "ZERO_RESULTS":
+                    log.warning("  API returned status: %s", api_status)
+                    if result.get("error_message"):
+                        log.warning("  API error: %s", result["error_message"])
+
                 if not places:
-                    log.info("    No results for this query/page.")
+                    log.info("    No results for this query/page. (API: %.1fs)", api_time)
                     break
 
                 pages_fetched += 1
                 log.info(
-                    "    Page %d: %d places (qualified so far: %d/%d)",
+                    "    Page %d: %d places returned (API: %.1fs) — qualified so far: %d/%d",
                     pages_fetched,
                     len(places),
+                    api_time,
                     len(qualified_leads),
                     TARGET_LEAD_COUNT,
                 )
@@ -893,42 +1000,77 @@ def collect_leads() -> list[Lead]:
                     place_id = place.get("place_id", "")
                     if not place_id:
                         continue
-                    # Cross-area dedup: skip if already seen from another area
+
+                    name = place.get("name", "Unknown")
+
+                    # Cross-area dedup
                     if place_id in seen_place_ids:
                         duplicates_skipped += 1
+                        log.info("    [%s] SKIP: duplicate (already seen in another area)", name)
                         continue
                     seen_place_ids.add(place_id)
                     total_scanned += 1
 
-                    name = place.get("name", "Unknown")
+                    biz_start = time.time()
+                    log.info("")
+                    log.info("    --- #%d: %s ---", total_scanned, name)
 
                     # Skip permanently closed businesses
                     if place.get("business_status") == "CLOSED_PERMANENTLY":
-                        log.debug("    Skipping closed business: %s", name)
+                        skipped_closed += 1
+                        log.info("    SKIP: permanently closed")
                         continue
 
                     # Fetch full details
+                    detail_start = time.time()
                     details = get_place_details(place_id)
+                    detail_time = time.time() - detail_start
                     if not details:
+                        log.info("    SKIP: Place Details API returned empty (%.1fs)", detail_time)
                         continue
 
-                    # Find email via multi-strategy approach
-                    email, email_source = find_email(details)
                     website = details.get("website", "")
+                    phone = details.get("formatted_phone_number", "")
+                    rating = details.get("rating", 0.0)
+                    reviews = details.get("user_ratings_total", 0)
+                    address = details.get("formatted_address", "")
+
+                    log.info(
+                        "    Details (%.1fs): rating=%.1f, reviews=%d, phone=%s, website=%s",
+                        detail_time,
+                        rating,
+                        reviews,
+                        "yes" if phone else "no",
+                        website[:60] if website else "NONE",
+                    )
+
+                    # Find email via multi-strategy approach
+                    email, email_source = find_email(details, business_name=name)
+
+                    biz_time = time.time() - biz_start
 
                     # REQUIRED: skip leads without email
                     if not email:
                         skipped_no_email += 1
-                        if skipped_no_email % 20 == 0:
-                            log.info(
-                                "    [%d leads skipped so far -- no email found]",
-                                skipped_no_email,
-                            )
+                        if not website:
+                            skipped_no_website += 1
+                        log.info(
+                            "    SKIP: no email found (%.1fs total for this business) "
+                            "[reason: %s]",
+                            biz_time,
+                            "no website to scrape" if not website else "scraping found nothing",
+                        )
+                        _print_stats_line(
+                            total_scanned, total_with_email,
+                            len(qualified_leads), skipped_no_email,
+                            duplicates_skipped, time.time() - run_start,
+                        )
                         continue
 
+                    total_with_email += 1
+
                     # Parse address and determine county / tax link
-                    raw_address = details.get("formatted_address", "")
-                    addr = parse_address_parts(raw_address)
+                    addr = parse_address_parts(address)
                     county = determine_county(addr["city"])
                     tax_link = get_tax_assessor_link(county, addr["full"])
 
@@ -941,12 +1083,12 @@ def collect_leads() -> list[Lead]:
                         business_name=details.get("name", name),
                         email=email,
                         email_source=email_source,
-                        phone=details.get("formatted_phone_number", ""),
+                        phone=phone,
                         address=addr["full"],
                         business_type=classify_business_type(types, query_type),
                         website=website,
-                        google_rating=details.get("rating", 0.0),
-                        num_reviews=details.get("user_ratings_total", 0),
+                        google_rating=rating,
+                        num_reviews=reviews,
                         has_parking=has_park,
                         large_parking=large_park,
                         recent_reviews=recent,
@@ -960,26 +1102,44 @@ def collect_leads() -> list[Lead]:
 
                     qualified_leads.append(lead)
                     log.info(
-                        "    + Lead #%d: %s | %s | score:%d | %s [%s]",
+                        "    QUALIFIED Lead #%d: %s | %s county | score:%d | "
+                        "%s [%s] (%.1fs)",
                         len(qualified_leads),
                         lead.business_name,
                         lead.county,
                         lead.lead_score,
                         lead.email,
                         lead.email_source,
+                        biz_time,
                     )
+                    _print_stats_line(
+                        total_scanned, total_with_email,
+                        len(qualified_leads), skipped_no_email,
+                        duplicates_skipped, time.time() - run_start,
+                    )
+
+                    # Incremental save every 10 qualified leads
+                    if len(qualified_leads) - last_save_count >= 10:
+                        _incremental_save(qualified_leads, OUTPUT_FILE)
+                        last_save_count = len(qualified_leads)
 
                 # Check for next page
                 page_token = result.get("next_page_token")
                 if not page_token:
                     break
 
+    total_time = time.time() - run_start
+    log.info("")
     log.info("-" * 60)
-    log.info("Collection complete.")
-    log.info("  Total places scanned : %d", total_scanned)
-    log.info("  Cross-area duplicates: %d", duplicates_skipped)
-    log.info("  Skipped (no email)   : %d", skipped_no_email)
-    log.info("  Qualified leads      : %d", len(qualified_leads))
+    log.info("Collection complete in %.0f seconds (%.1f minutes).", total_time, total_time / 60)
+    log.info("  Total places scanned  : %d", total_scanned)
+    log.info("  Cross-area duplicates : %d", duplicates_skipped)
+    log.info("  Permanently closed    : %d", skipped_closed)
+    log.info("  Skipped (no email)    : %d", skipped_no_email)
+    log.info("    - No website at all : %d", skipped_no_website)
+    log.info("    - Had website, no   : %d", skipped_no_email - skipped_no_website)
+    log.info("      email found")
+    log.info("  Qualified leads       : %d", len(qualified_leads))
 
     return qualified_leads
 
@@ -1059,6 +1219,7 @@ def main() -> None:
         log.warning("No qualified leads found. Check your API key and network.")
         sys.exit(1)
 
+    # Final export (re-sorts by score; overwrites any incremental saves)
     export_to_csv(leads, OUTPUT_FILE)
 
     # Print summary
@@ -1066,6 +1227,7 @@ def main() -> None:
     print("LEAD GENERATION COMPLETE")
     print("=" * 60)
     print(f"  Output file : {OUTPUT_FILE}")
+    print(f"  (incremental saves were made every 10 leads during the run)")
     print(f"  Total leads : {len(leads)}")
     if leads:
         scores = [l.lead_score for l in leads]

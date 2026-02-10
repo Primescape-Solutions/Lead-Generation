@@ -2,11 +2,12 @@
 """
 Hospitality Lead Generator
 ===========================
-Finds hotel and restaurant owners/managers near Elkin, NC (28621)
-within a 50-mile radius using the Google Places API.
+Finds hotel and restaurant owners/managers near Elkin, Wilkesboro,
+and Statesville, NC using the Google Places API.
 
-Collects exactly 100 qualified leads (must have email), scores them,
-and exports to CSV sorted by lead score.
+Searches three overlapping 25-mile-radius zones, de-duplicates results,
+collects 100 qualified leads (must have email), scores them, determines
+the county and tax-assessor lookup link for each, and exports to CSV.
 
 Usage:
     python lead_generator.py
@@ -23,6 +24,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
+from urllib.parse import quote_plus
 
 import requests
 from dotenv import load_dotenv
@@ -35,12 +37,15 @@ load_dotenv()
 
 API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")
 
-# Elkin, NC coordinates
-CENTER_LAT = 36.2440
-CENTER_LNG = -80.8487
+# Three search areas — each searched with a 25-mile radius
+SEARCH_AREAS = [
+    {"name": "Elkin, NC (28621)",       "lat": 36.2440, "lng": -80.8487},
+    {"name": "Wilkesboro, NC (28697)",  "lat": 36.1460, "lng": -81.1604},
+    {"name": "Statesville, NC (28677)", "lat": 35.7826, "lng": -80.8873},
+]
 
-# 50 miles in meters
-RADIUS_METERS = 80467
+# 25 miles in meters
+RADIUS_METERS = 40234
 
 # Business types to search for
 SEARCH_QUERIES = [
@@ -95,6 +100,9 @@ class Lead:
     lead_score: int = 0
     notes: str = ""
     place_id: str = ""
+    search_area: str = ""          # which of the 3 zones found it
+    county: str = ""               # NC county name
+    tax_assessor_link: str = ""    # clickable URL for property lookup
 
 
 # ---------------------------------------------------------------------------
@@ -130,12 +138,17 @@ def _api_get(url: str, params: dict, retries: int = 3) -> dict:
     return {}
 
 
-def search_nearby(query: str, page_token: str | None = None) -> dict:
+def search_nearby(
+    query: str,
+    lat: float,
+    lng: float,
+    page_token: str | None = None,
+) -> dict:
     """Search for places using the Text Search endpoint."""
     url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
     params = {
         "query": query,
-        "location": f"{CENTER_LAT},{CENTER_LNG}",
+        "location": f"{lat},{lng}",
         "radius": RADIUS_METERS,
         "key": API_KEY,
     }
@@ -519,6 +532,260 @@ def score_lead(lead: Lead) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Address parsing, county lookup, and tax assessor links
+# ---------------------------------------------------------------------------
+
+# City/town → county mapping for the NC foothills / piedmont region.
+# Covers the 25-mile radius around Elkin, Wilkesboro, and Statesville.
+_CITY_TO_COUNTY: dict[str, str] = {
+    # Wilkes County
+    "wilkesboro": "Wilkes",
+    "north wilkesboro": "Wilkes",
+    "n wilkesboro": "Wilkes",
+    "ronda": "Wilkes",
+    "moravian falls": "Wilkes",
+    "hays": "Wilkes",
+    "purlear": "Wilkes",
+    "millers creek": "Wilkes",
+    "champion": "Wilkes",
+    "traphill": "Wilkes",
+    "boomer": "Wilkes",
+    "cricket": "Wilkes",
+    "mcgrady": "Wilkes",
+    "ferguson": "Wilkes",
+    "darby": "Wilkes",
+    # Surry County
+    "elkin": "Surry",
+    "mount airy": "Surry",
+    "mt airy": "Surry",
+    "pilot mountain": "Surry",
+    "dobson": "Surry",
+    "lowgap": "Surry",
+    "state road": "Surry",
+    "ararat": "Surry",
+    "toast": "Surry",
+    "white plains": "Surry",
+    "westfield": "Surry",
+    "siloam": "Surry",
+    # Yadkin County
+    "yadkinville": "Yadkin",
+    "jonesville": "Yadkin",
+    "boonville": "Yadkin",
+    "east bend": "Yadkin",
+    "hamptonville": "Yadkin",
+    "courtney": "Yadkin",
+    # Iredell County
+    "statesville": "Iredell",
+    "mooresville": "Iredell",
+    "troutman": "Iredell",
+    "harmony": "Iredell",
+    "love valley": "Iredell",
+    "union grove": "Iredell",
+    "cool springs": "Iredell",
+    "olin": "Iredell",
+    "turnersburg": "Iredell",
+    "stony point": "Iredell",
+    "hiddenite": "Iredell",
+    # Alleghany County
+    "sparta": "Alleghany",
+    "piney creek": "Alleghany",
+    "laurel springs": "Alleghany",
+    "ennice": "Alleghany",
+    "roaring gap": "Alleghany",
+    # Ashe County
+    "west jefferson": "Ashe",
+    "jefferson": "Ashe",
+    "todd": "Ashe",
+    "lansing": "Ashe",
+    "grassy creek": "Ashe",
+    "warrensville": "Ashe",
+    "crumpler": "Ashe",
+    # Watauga County
+    "boone": "Watauga",
+    "blowing rock": "Watauga",
+    "banner elk": "Watauga",
+    "sugar grove": "Watauga",
+    "valle crucis": "Watauga",
+    "vilas": "Watauga",
+    "deep gap": "Watauga",
+    # Alexander County
+    "taylorsville": "Alexander",
+    "bethlehem": "Alexander",
+    "stony point": "Alexander",
+    "hiddenite": "Alexander",
+    # Caldwell County
+    "lenoir": "Caldwell",
+    "hudson": "Caldwell",
+    "granite falls": "Caldwell",
+    "sawmills": "Caldwell",
+    "gamewell": "Caldwell",
+    "patterson": "Caldwell",
+    # Catawba County
+    "hickory": "Catawba",
+    "newton": "Catawba",
+    "conover": "Catawba",
+    "maiden": "Catawba",
+    "claremont": "Catawba",
+    "catawba": "Catawba",
+    "long view": "Catawba",
+    "sherrills ford": "Catawba",
+    # Davie County
+    "mocksville": "Davie",
+    "advance": "Davie",
+    "cooleemee": "Davie",
+    "bermuda run": "Davie",
+    # Stokes County
+    "danbury": "Stokes",
+    "king": "Stokes",
+    "walnut cove": "Stokes",
+    "pine hall": "Stokes",
+    "germanton": "Stokes",
+    # Forsyth County
+    "winston-salem": "Forsyth",
+    "winston salem": "Forsyth",
+    "kernersville": "Forsyth",
+    "clemmons": "Forsyth",
+    "lewisville": "Forsyth",
+    "rural hall": "Forsyth",
+    "tobaccoville": "Forsyth",
+    "pfafftown": "Forsyth",
+    "bethania": "Forsyth",
+    # Rowan County
+    "salisbury": "Rowan",
+    "china grove": "Rowan",
+    "spencer": "Rowan",
+    "landis": "Rowan",
+    "east spencer": "Rowan",
+    "rockwell": "Rowan",
+    "granite quarry": "Rowan",
+    "faith": "Rowan",
+    "cleveland": "Rowan",
+    # Lincoln County
+    "lincolnton": "Lincoln",
+    "denver": "Lincoln",
+    "iron station": "Lincoln",
+    "vale": "Lincoln",
+    # Avery County
+    "banner elk": "Avery",
+    "newland": "Avery",
+    "linville": "Avery",
+    "elk park": "Avery",
+    "crossnore": "Avery",
+    # Burke County
+    "morganton": "Burke",
+    "valdese": "Burke",
+    "drexel": "Burke",
+    "connelly springs": "Burke",
+    "glen alpine": "Burke",
+}
+
+# County → online property-search / GIS portal URL.
+# Most NC counties use a <county>.webgis.net portal or their own tax site.
+_COUNTY_TAX_URLS: dict[str, str] = {
+    "Wilkes":    "https://wilkes.webgis.net/",
+    "Surry":     "https://surry.webgis.net/",
+    "Yadkin":    "https://yadkin.webgis.net/",
+    "Iredell":   "https://iredell.webgis.net/",
+    "Alleghany": "https://alleghany.webgis.net/",
+    "Ashe":      "https://ashe.webgis.net/",
+    "Watauga":   "https://watauga.webgis.net/",
+    "Alexander": "https://alexander.webgis.net/",
+    "Caldwell":  "https://caldwell.webgis.net/",
+    "Catawba":   "https://catawba.webgis.net/",
+    "Davie":     "https://davie.webgis.net/",
+    "Stokes":    "https://stokes.webgis.net/",
+    "Forsyth":   "https://forsyth.webgis.net/",
+    "Rowan":     "https://rowan.webgis.net/",
+    "Lincoln":   "https://lincoln.webgis.net/",
+    "Avery":     "https://avery.webgis.net/",
+    "Burke":     "https://burke.webgis.net/",
+}
+
+# Fallback: NC statewide GIS search
+_NC_FALLBACK_URL = "https://www.nconemap.gov/"
+
+
+def parse_address_parts(formatted_address: str) -> dict[str, str]:
+    """
+    Parse a Google-formatted address into components.
+
+    Google Places returns addresses like:
+        '123 Main St, Elkin, NC 28621, USA'
+        '456 Broad St, Statesville, NC 28677, United States'
+
+    Returns dict with keys: street, city, state, zip, full.
+    """
+    parts = {
+        "street": "",
+        "city": "",
+        "state": "",
+        "zip": "",
+        "full": formatted_address,
+    }
+    if not formatted_address:
+        return parts
+
+    # Remove trailing country
+    addr = re.sub(r",?\s*(USA|United States|US)\s*$", "", formatted_address, flags=re.IGNORECASE).strip()
+
+    # Split on commas
+    segments = [s.strip() for s in addr.split(",")]
+
+    if len(segments) >= 3:
+        # "123 Main St", "Elkin", "NC 28621"
+        parts["street"] = segments[0]
+        parts["city"] = segments[-2]
+        state_zip = segments[-1]
+    elif len(segments) == 2:
+        parts["street"] = segments[0]
+        state_zip = segments[1]
+    else:
+        state_zip = segments[0]
+
+    # Parse "NC 28621" from the last segment
+    m = re.match(r"([A-Z]{2})\s+(\d{5}(?:-\d{4})?)", state_zip)
+    if m:
+        parts["state"] = m.group(1)
+        parts["zip"] = m.group(2)
+    else:
+        parts["state"] = state_zip.strip()
+
+    # Rebuild a clean full address: street, city, state zip
+    full_parts = []
+    if parts["street"]:
+        full_parts.append(parts["street"])
+    if parts["city"]:
+        full_parts.append(parts["city"])
+    sz = parts["state"]
+    if parts["zip"]:
+        sz += " " + parts["zip"]
+    if sz.strip():
+        full_parts.append(sz.strip())
+    parts["full"] = ", ".join(full_parts) if full_parts else formatted_address
+
+    return parts
+
+
+def determine_county(city: str) -> str:
+    """Look up the NC county for a city name. Returns '' if unknown."""
+    if not city:
+        return ""
+    return _CITY_TO_COUNTY.get(city.lower().strip(), "")
+
+
+def get_tax_assessor_link(county: str, address: str) -> str:
+    """
+    Return a clickable tax-assessor URL for the given county.
+
+    If the county has a known portal, returns that URL.
+    Otherwise returns the NC statewide GIS fallback.
+    """
+    if county and county in _COUNTY_TAX_URLS:
+        return _COUNTY_TAX_URLS[county]
+    return _NC_FALLBACK_URL
+
+
+# ---------------------------------------------------------------------------
 # Main collection logic
 # ---------------------------------------------------------------------------
 
@@ -556,126 +823,163 @@ def build_notes(lead: Lead) -> str:
 
 
 def collect_leads() -> list[Lead]:
-    """Run the full lead collection pipeline."""
+    """
+    Run the full lead collection pipeline.
+
+    Iterates over all three search areas, runs every query in each area,
+    de-duplicates by place_id across areas, enriches with county and
+    tax-assessor data, and stops once TARGET_LEAD_COUNT qualified leads
+    are collected.
+    """
     seen_place_ids: set[str] = set()
     qualified_leads: list[Lead] = []
+    duplicates_skipped = 0
     total_scanned = 0
     skipped_no_email = 0
 
-    log.info("Starting lead collection for hospitality businesses near Elkin, NC")
+    area_names = [a["name"] for a in SEARCH_AREAS]
+    log.info("Starting lead collection for hospitality businesses")
+    log.info("Search areas: %s", " | ".join(area_names))
     log.info("Target: %d qualified leads (must have email)", TARGET_LEAD_COUNT)
-    log.info("Search radius: 50 miles from Elkin, NC (28621)")
+    log.info("Search radius: 25 miles per area")
     log.info("-" * 60)
 
-    for query_text, query_type in SEARCH_QUERIES:
+    for area in SEARCH_AREAS:
         if len(qualified_leads) >= TARGET_LEAD_COUNT:
             break
 
-        full_query = f"{query_text} near Elkin NC"
-        log.info("Searching: '%s'", full_query)
+        area_name = area["name"]
+        area_lat = area["lat"]
+        area_lng = area["lng"]
+        # Short city name for building the search query
+        area_city = area_name.split(",")[0]  # e.g. "Elkin"
 
-        page_token = None
-        pages_fetched = 0
+        log.info("=== Searching area: %s ===", area_name)
 
-        while True:
+        for query_text, query_type in SEARCH_QUERIES:
             if len(qualified_leads) >= TARGET_LEAD_COUNT:
                 break
 
-            result = search_nearby(full_query, page_token)
-            places = result.get("results", [])
+            full_query = f"{query_text} near {area_city} NC"
+            log.info("  Query: '%s'", full_query)
 
-            if not places:
-                log.info("  No results for this query/page.")
-                break
+            page_token = None
+            pages_fetched = 0
 
-            pages_fetched += 1
-            log.info(
-                "  Page %d: %d places found (qualified so far: %d/%d)",
-                pages_fetched,
-                len(places),
-                len(qualified_leads),
-                TARGET_LEAD_COUNT,
-            )
-
-            for place in places:
+            while True:
                 if len(qualified_leads) >= TARGET_LEAD_COUNT:
                     break
 
-                place_id = place.get("place_id", "")
-                if not place_id or place_id in seen_place_ids:
-                    continue
-                seen_place_ids.add(place_id)
-                total_scanned += 1
+                result = search_nearby(full_query, area_lat, area_lng, page_token)
+                places = result.get("results", [])
 
-                name = place.get("name", "Unknown")
+                if not places:
+                    log.info("    No results for this query/page.")
+                    break
 
-                # Skip permanently closed businesses
-                if place.get("business_status") == "CLOSED_PERMANENTLY":
-                    log.debug("  Skipping closed business: %s", name)
-                    continue
-
-                # Fetch full details
-                details = get_place_details(place_id)
-                if not details:
-                    continue
-
-                # Find email via multi-strategy approach
-                email, email_source = find_email(details)
-                website = details.get("website", "")
-
-                # REQUIRED: skip leads without email
-                if not email:
-                    skipped_no_email += 1
-                    if skipped_no_email % 20 == 0:
-                        log.info(
-                            "  [%d leads skipped so far -- no email found]",
-                            skipped_no_email,
-                        )
-                    continue
-
-                # Build the lead
-                has_park, large_park = check_parking(details)
-                recent = has_recent_reviews(details)
-                types = details.get("types", []) or place.get("types", [])
-
-                lead = Lead(
-                    business_name=details.get("name", name),
-                    email=email,
-                    email_source=email_source,
-                    phone=details.get("formatted_phone_number", ""),
-                    address=details.get("formatted_address", ""),
-                    business_type=classify_business_type(types, query_type),
-                    website=website,
-                    google_rating=details.get("rating", 0.0),
-                    num_reviews=details.get("user_ratings_total", 0),
-                    has_parking=has_park,
-                    large_parking=large_park,
-                    recent_reviews=recent,
-                    place_id=place_id,
-                )
-                lead.lead_score = score_lead(lead)
-                lead.notes = build_notes(lead)
-
-                qualified_leads.append(lead)
+                pages_fetched += 1
                 log.info(
-                    "  + Lead #%d: %s (score: %d, email: %s [%s])",
+                    "    Page %d: %d places (qualified so far: %d/%d)",
+                    pages_fetched,
+                    len(places),
                     len(qualified_leads),
-                    lead.business_name,
-                    lead.lead_score,
-                    lead.email,
-                    lead.email_source,
+                    TARGET_LEAD_COUNT,
                 )
 
-            # Check for next page
-            page_token = result.get("next_page_token")
-            if not page_token:
-                break
+                for place in places:
+                    if len(qualified_leads) >= TARGET_LEAD_COUNT:
+                        break
+
+                    place_id = place.get("place_id", "")
+                    if not place_id:
+                        continue
+                    # Cross-area dedup: skip if already seen from another area
+                    if place_id in seen_place_ids:
+                        duplicates_skipped += 1
+                        continue
+                    seen_place_ids.add(place_id)
+                    total_scanned += 1
+
+                    name = place.get("name", "Unknown")
+
+                    # Skip permanently closed businesses
+                    if place.get("business_status") == "CLOSED_PERMANENTLY":
+                        log.debug("    Skipping closed business: %s", name)
+                        continue
+
+                    # Fetch full details
+                    details = get_place_details(place_id)
+                    if not details:
+                        continue
+
+                    # Find email via multi-strategy approach
+                    email, email_source = find_email(details)
+                    website = details.get("website", "")
+
+                    # REQUIRED: skip leads without email
+                    if not email:
+                        skipped_no_email += 1
+                        if skipped_no_email % 20 == 0:
+                            log.info(
+                                "    [%d leads skipped so far -- no email found]",
+                                skipped_no_email,
+                            )
+                        continue
+
+                    # Parse address and determine county / tax link
+                    raw_address = details.get("formatted_address", "")
+                    addr = parse_address_parts(raw_address)
+                    county = determine_county(addr["city"])
+                    tax_link = get_tax_assessor_link(county, addr["full"])
+
+                    # Build the lead
+                    has_park, large_park = check_parking(details)
+                    recent = has_recent_reviews(details)
+                    types = details.get("types", []) or place.get("types", [])
+
+                    lead = Lead(
+                        business_name=details.get("name", name),
+                        email=email,
+                        email_source=email_source,
+                        phone=details.get("formatted_phone_number", ""),
+                        address=addr["full"],
+                        business_type=classify_business_type(types, query_type),
+                        website=website,
+                        google_rating=details.get("rating", 0.0),
+                        num_reviews=details.get("user_ratings_total", 0),
+                        has_parking=has_park,
+                        large_parking=large_park,
+                        recent_reviews=recent,
+                        place_id=place_id,
+                        search_area=area_name,
+                        county=county if county else "Unknown",
+                        tax_assessor_link=tax_link,
+                    )
+                    lead.lead_score = score_lead(lead)
+                    lead.notes = build_notes(lead)
+
+                    qualified_leads.append(lead)
+                    log.info(
+                        "    + Lead #%d: %s | %s | score:%d | %s [%s]",
+                        len(qualified_leads),
+                        lead.business_name,
+                        lead.county,
+                        lead.lead_score,
+                        lead.email,
+                        lead.email_source,
+                    )
+
+                # Check for next page
+                page_token = result.get("next_page_token")
+                if not page_token:
+                    break
 
     log.info("-" * 60)
     log.info("Collection complete.")
-    log.info("  Total places scanned: %d", total_scanned)
-    log.info("  Skipped (no email):   %d", skipped_no_email)
-    log.info("  Qualified leads:      %d", len(qualified_leads))
+    log.info("  Total places scanned : %d", total_scanned)
+    log.info("  Cross-area duplicates: %d", duplicates_skipped)
+    log.info("  Skipped (no email)   : %d", skipped_no_email)
+    log.info("  Qualified leads      : %d", len(qualified_leads))
 
     return qualified_leads
 
@@ -689,12 +993,15 @@ CSV_COLUMNS = [
     "Email",
     "Email Source",
     "Phone",
-    "Address",
+    "Full Property Address",
+    "County",
     "Business Type",
     "Website",
     "Google Rating",
     "Number of Reviews",
     "Lead Score",
+    "Search Area",
+    "Tax Assessor Link",
     "Notes",
 ]
 
@@ -715,11 +1022,14 @@ def export_to_csv(leads: list[Lead], filepath: str) -> None:
                     lead.email_source,
                     lead.phone,
                     lead.address,
+                    lead.county,
                     lead.business_type,
                     lead.website,
                     lead.google_rating,
                     lead.num_reviews,
                     lead.lead_score,
+                    lead.search_area,
+                    lead.tax_assessor_link,
                     lead.notes,
                 ]
             )
@@ -766,6 +1076,22 @@ def main() -> None:
         restaurants = sum(1 for l in leads if "Restaurant" in l.business_type)
         print(f"  Hotels      : {hotels}")
         print(f"  Restaurants : {restaurants}")
+
+        # Per-area breakdown
+        print()
+        print("  Leads by search area:")
+        for area in SEARCH_AREAS:
+            count = sum(1 for l in leads if l.search_area == area["name"])
+            print(f"    {area['name']}: {count}")
+
+        # County breakdown
+        print()
+        print("  Leads by county:")
+        county_counts: dict[str, int] = {}
+        for l in leads:
+            county_counts[l.county] = county_counts.get(l.county, 0) + 1
+        for county, count in sorted(county_counts.items(), key=lambda x: -x[1]):
+            print(f"    {county}: {count}")
 
         # Email source breakdown
         from_google = sum(1 for l in leads if l.email_source == "Google Places")
